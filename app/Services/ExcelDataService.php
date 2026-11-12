@@ -5,7 +5,7 @@ namespace App\Services;
 use App\Models\DataPendaftar;
 use App\Models\RiwayatImpor;
 use Illuminate\Support\Facades\DB;
-use PhpOffice\PhpSpreadsheet\IOFactory;
+use PhpOffice\PhpSpreadsheet\Reader\Xlsx as XlsxReader;
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 use RuntimeException;
@@ -179,8 +179,27 @@ class ExcelDataService
             $mentahBulan = $itemBaris['b'];
             $mentahJumlah = $itemBaris['c'];
 
+            // Jika pengguna menempelkan format CSV "2024,1,32" atau "2024;1;32" ke dalam kolom A saja
+            if (
+                is_string($mentahTahun)
+                && ($mentahBulan === null || trim((string) $mentahBulan) === '')
+                && ($mentahJumlah === null || trim((string) $mentahJumlah) === '')
+                && (str_contains($mentahTahun, ',') || str_contains($mentahTahun, ';'))
+            ) {
+                $pemisah = str_contains($mentahTahun, ';') ? ';' : ',';
+                $pecahan = array_map('trim', explode($pemisah, $mentahTahun));
+                $mentahTahun = $pecahan[0] ?? null;
+                $mentahBulan = $pecahan[1] ?? null;
+                $mentahJumlah = $pecahan[2] ?? null;
+            }
+
             // Lewati baris yang benar-benar kosong seluruh kolomnya
             if ($this->apakahBarisKosong($mentahTahun, $mentahBulan, $mentahJumlah)) {
+                continue;
+            }
+
+            // Lewati baris header jika terbaca ulang (misal "Tahun")
+            if (is_string($mentahTahun) && strtolower(trim($mentahTahun)) === 'tahun') {
                 continue;
             }
 
@@ -351,15 +370,22 @@ class ExcelDataService
 
     /**
      * Ekstrak baris data (mulai baris ke-2) dari berkas .xlsx.
-     * Menggunakan PhpSpreadsheet dengan fallback pembacaan ZIP/XML langsung
-     * untuk kompatibilitas penuh pada environment Windows terisolasi.
+     * Menggunakan XlsxReader PhpSpreadsheet, fallback pembacaan ZIP/XML langsung,
+     * serta fallback teks CSV apabila berkas disimpan sebagai teks berpemisah koma/titik-koma.
      *
      * @return list<array{baris: int, a: mixed, b: mixed, c: mixed}>
      */
     private function bacaBarisXlsx(string $filePath): array
     {
+        if ($filePath === '' || ! is_file($filePath)) {
+            throw new RuntimeException('Berkas impor tidak ditemukan.');
+        }
+
+        // 1. Coba gunakan XlsxReader dari PhpSpreadsheet secara eksplisit
         try {
-            $spreadsheet = IOFactory::load($filePath);
+            $reader = new XlsxReader();
+            $reader->setReadDataOnly(true);
+            $spreadsheet = $reader->load($filePath);
             $sheet = $spreadsheet->getActiveSheet();
             $barisTertinggi = $sheet->getHighestDataRow();
 
@@ -367,16 +393,26 @@ class ExcelDataService
             for ($nomorBaris = 2; $nomorBaris <= $barisTertinggi; $nomorBaris++) {
                 $hasil[] = [
                     'baris' => $nomorBaris,
-                    'a' => $sheet->getCell("A{$nomorBaris}")->getValue(),
-                    'b' => $sheet->getCell("B{$nomorBaris}")->getValue(),
-                    'c' => $sheet->getCell("C{$nomorBaris}")->getValue(),
+                    'a' => $sheet->getCell("A{$nomorBaris}")->getCalculatedValue(),
+                    'b' => $sheet->getCell("B{$nomorBaris}")->getCalculatedValue(),
+                    'c' => $sheet->getCell("C{$nomorBaris}")->getCalculatedValue(),
                 ];
             }
 
             return $hasil;
         } catch (Throwable) {
-            return $this->bacaBarisDariZipXlsx($filePath);
+            // Lanjut ke fallback berikutnya
         }
+
+        // 2. Coba baca langsung struktur ZIP XML .xlsx (tahan terhadap perbedaan namespace & permission Windows)
+        try {
+            return $this->bacaBarisDariZipXlsx($filePath);
+        } catch (Throwable) {
+            // Lanjut ke fallback CSV/teks
+        }
+
+        // 3. Fallback jika berkas .xlsx ternyata disimpan dalam format teks CSV / TSV
+        return $this->bacaBarisDariTeksCsv($filePath);
     }
 
     /**
@@ -388,50 +424,78 @@ class ExcelDataService
     {
         $zip = new ZipArchive();
         if ($zip->open($filePath) !== true) {
-            throw new RuntimeException('Berkas .xlsx tidak dapat dibuka.');
+            throw new RuntimeException('Berkas .xlsx tidak dapat dibuka sebagai arsip ZIP.');
         }
 
         $sharedStrings = [];
         $sharedXmlContent = $zip->getFromName('xl/sharedStrings.xml');
         if ($sharedXmlContent !== false) {
-            $sharedXml = new SimpleXMLElement($sharedXmlContent);
-            foreach ($sharedXml->si as $si) {
-                if (isset($si->t)) {
-                    $sharedStrings[] = (string) $si->t;
-                } else {
-                    $teksGabungan = '';
-                    foreach ($si->r as $run) {
-                        $teksGabungan .= (string) $run->t;
+            $sharedXmlClean = $this->bersihkanNamespaceXml($sharedXmlContent);
+            $sharedXml = new SimpleXMLElement($sharedXmlClean, LIBXML_NOERROR | LIBXML_NOWARNING | LIBXML_NONET);
+            if (isset($sharedXml->si)) {
+                foreach ($sharedXml->si as $si) {
+                    if (isset($si->t)) {
+                        $sharedStrings[] = (string) $si->t;
+                    } else {
+                        $teksGabungan = '';
+                        if (isset($si->r)) {
+                            foreach ($si->r as $run) {
+                                $teksGabungan .= (string) ($run->t ?? '');
+                            }
+                        }
+                        $sharedStrings[] = $teksGabungan;
                     }
-                    $sharedStrings[] = $teksGabungan;
                 }
             }
         }
 
+        // Cari worksheet pertama di xl/worksheets/
         $sheetXmlContent = $zip->getFromName('xl/worksheets/sheet1.xml');
+        if ($sheetXmlContent === false) {
+            for ($i = 0; $i < $zip->numFiles; $i++) {
+                $stat = $zip->statIndex($i);
+                $namaEntry = (string) ($stat['name'] ?? '');
+                if (preg_match('#^xl/worksheets/sheet\d*\.xml$#i', $namaEntry)) {
+                    $sheetXmlContent = $zip->getFromIndex($i);
+                    break;
+                }
+            }
+        }
+
         $zip->close();
 
         if ($sheetXmlContent === false) {
             throw new RuntimeException('Worksheet utama tidak ditemukan di dalam berkas .xlsx.');
         }
 
-        $sheetXml = new SimpleXMLElement($sheetXmlContent);
+        $sheetXmlClean = $this->bersihkanNamespaceXml($sheetXmlContent);
+        $sheetXml = new SimpleXMLElement($sheetXmlClean, LIBXML_NOERROR | LIBXML_NOWARNING | LIBXML_NONET);
         if (! isset($sheetXml->sheetData->row)) {
             return [];
         }
 
         $hasil = [];
+        $fallbackRowIndex = 0;
+        $daftarHuruf = ['A', 'B', 'C'];
+
         foreach ($sheetXml->sheetData->row as $row) {
-            $nomorBaris = (int) ($row['r'] ?? 0);
+            $fallbackRowIndex++;
+            $nomorBaris = isset($row['r']) ? (int) $row['r'] : $fallbackRowIndex;
             if ($nomorBaris < 2) {
                 continue;
             }
 
             $kolom = ['A' => null, 'B' => null, 'C' => null];
+            $indeksSel = 0;
 
             foreach ($row->c as $cell) {
                 $ref = (string) ($cell['r'] ?? '');
                 $hurufKolom = preg_replace('/[^A-Z]/', '', strtoupper($ref)) ?: '';
+                if ($hurufKolom === '' && isset($daftarHuruf[$indeksSel])) {
+                    $hurufKolom = $daftarHuruf[$indeksSel];
+                }
+                $indeksSel++;
+
                 if (! array_key_exists($hurufKolom, $kolom)) {
                     continue;
                 }
@@ -442,6 +506,8 @@ class ExcelDataService
                     $kolom[$hurufKolom] = $sharedStrings[$indeksString] ?? '';
                 } elseif ($tipe === 'inlineStr') {
                     $kolom[$hurufKolom] = isset($cell->is->t) ? (string) $cell->is->t : '';
+                } elseif ($tipe === 'str') {
+                    $kolom[$hurufKolom] = isset($cell->v) ? (string) $cell->v : '';
                 } else {
                     $kolom[$hurufKolom] = isset($cell->v) ? (string) $cell->v : null;
                 }
@@ -456,6 +522,72 @@ class ExcelDataService
         }
 
         return $hasil;
+    }
+
+    /**
+     * Fallback pembacaan apabila berkas disimpan sebagai teks CSV/TSV.
+     *
+     * @return list<array{baris: int, a: mixed, b: mixed, c: mixed}>
+     */
+    private function bacaBarisDariTeksCsv(string $filePath): array
+    {
+        $isi = @file_get_contents($filePath);
+        if (! is_string($isi) || trim($isi) === '') {
+            throw new RuntimeException('Berkas kosong atau tidak dapat dibaca.');
+        }
+
+        // Pastikan bukan berkas biner acak
+        if (str_contains($isi, "\x00")) {
+            throw new RuntimeException('Berkas biner tidak dikenali sebagai .xlsx yang valid.');
+        }
+
+        // Hapus UTF-8 BOM jika ada
+        $isi = preg_replace('/^\xEF\xBB\xBF/', '', $isi) ?? $isi;
+        $barisTeks = preg_split('/\r\n|\r|\n/', trim($isi)) ?: [];
+
+        if (count($barisTeks) < 2) {
+            throw new RuntimeException('Berkas tidak memiliki baris data.');
+        }
+
+        $hasil = [];
+        foreach ($barisTeks as $indeks => $baris) {
+            $nomorBaris = $indeks + 1;
+            if ($nomorBaris === 1) {
+                continue;
+            }
+
+            if (trim($baris) === '') {
+                continue;
+            }
+
+            $pemisah = str_contains($baris, ';')
+                ? ';'
+                : (str_contains($baris, "\t") ? "\t" : ',');
+
+            $kolom = str_getcsv($baris, $pemisah);
+
+            $hasil[] = [
+                'baris' => $nomorBaris,
+                'a' => $kolom[0] ?? null,
+                'b' => $kolom[1] ?? null,
+                'c' => $kolom[2] ?? null,
+            ];
+        }
+
+        return $hasil;
+    }
+
+    /**
+     * Hapus deklarasi namespace XML default & prefix elemen/atribut agar SimpleXMLElement
+     * dapat mengakses tag secara konsisten dari berbagai versi aplikasi spreadsheet.
+     */
+    private function bersihkanNamespaceXml(string $xml): string
+    {
+        $xml = preg_replace('/\s*xmlns(?::[a-zA-Z0-9_-]+)?="[^"]*"/i', '', $xml) ?? $xml;
+        $xml = preg_replace('/(<\/?)[a-zA-Z0-9_-]+:/', '$1', $xml) ?? $xml;
+        $xml = preg_replace('/(\s+)[a-zA-Z0-9_-]+:([a-zA-Z0-9_-]+\s*=)/', '$1$2', $xml) ?? $xml;
+
+        return $xml;
     }
 
     /**
@@ -496,6 +628,11 @@ class ExcelDataService
             return null;
         }
 
+        // Tangani format angka bulat dari Excel seperti "2024.0"
+        if (preg_match('/^-?\d+\.0+$/', $teks)) {
+            return (int) round((float) $teks);
+        }
+
         if (! preg_match('/^-?\d+$/', $teks)) {
             return null;
         }
@@ -509,6 +646,10 @@ class ExcelDataService
     private function streamSpreadsheet(Spreadsheet $spreadsheet, string $namaFile): StreamedResponse
     {
         return response()->streamDownload(static function () use ($spreadsheet): void {
+            if (ob_get_length()) {
+                ob_clean();
+            }
+
             $writer = new Xlsx($spreadsheet);
             $writer->save('php://output');
         }, $namaFile, [

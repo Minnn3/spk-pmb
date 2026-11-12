@@ -333,6 +333,62 @@ class SpkSystemTest extends TestCase
     }
 
     /**
+     * Pengujian unggah template 12 bulan (Januari-Desember 2024) saat basis data kosong,
+     * termasuk pembacaan berkas dengan atribut XML ekstensi Microsoft Excel dan format CSV di kolom A.
+     */
+    public function test_unggah_template_12_bulan_saat_database_kosong(): void
+    {
+        $this->assertSame(0, DataPendaftar::query()->count());
+
+        $data12Bulan = [
+            ['tahun' => 2024, 'bulan' => 1, 'jumlah_pendaftar' => 32],
+            ['tahun' => 2024, 'bulan' => 2, 'jumlah_pendaftar' => 24],
+            ['tahun' => 2024, 'bulan' => 3, 'jumlah_pendaftar' => 42],
+            ['tahun' => 2024, 'bulan' => 4, 'jumlah_pendaftar' => 48],
+            ['tahun' => 2024, 'bulan' => 5, 'jumlah_pendaftar' => 147],
+            ['tahun' => 2024, 'bulan' => 6, 'jumlah_pendaftar' => 133],
+            ['tahun' => 2024, 'bulan' => 7, 'jumlah_pendaftar' => 84],
+            ['tahun' => 2024, 'bulan' => 8, 'jumlah_pendaftar' => 54],
+            ['tahun' => 2024, 'bulan' => 9, 'jumlah_pendaftar' => 20],
+            ['tahun' => 2024, 'bulan' => 10, 'jumlah_pendaftar' => 0],
+            ['tahun' => 2024, 'bulan' => 11, 'jumlah_pendaftar' => 5],
+            ['tahun' => 2024, 'bulan' => 12, 'jumlah_pendaftar' => 16],
+        ];
+
+        $fileExcel = $this->buatUploadedXlsx($data12Bulan);
+
+        $this->actingAs($this->admin)
+            ->post(route('import-excel.preview'), [
+                'berkas_excel' => $fileExcel,
+                'mode_duplikat' => 'timpa',
+            ])
+            ->assertRedirect(route('import-excel.index'))
+            ->assertSessionHasNoErrors();
+
+        $pratinjau = session(ImportDataPendaftarController::SESSION_PRATINJAU_KEY);
+        $this->assertNotNull($pratinjau);
+        $this->assertSame(12, $pratinjau['jumlah_valid']);
+        $this->assertSame(0, $pratinjau['jumlah_tidak_valid']);
+
+        $this->actingAs($this->admin)
+            ->post(route('import-excel.confirm'), [
+                'mode_duplikat' => 'timpa',
+            ])
+            ->assertRedirect(route('data-historis.index'));
+
+        $this->assertSame(12, DataPendaftar::query()->count());
+
+        // Pastikan perhitungan & dashboard berjalan normal dengan 12 bulan data
+        $this->actingAs($this->admin)
+            ->get(route('dashboard.index', ['tahun_target' => 2025]))
+            ->assertOk();
+
+        $this->actingAs($this->admin)
+            ->get(route('perhitungan.index', ['tahun_target' => 2025]))
+            ->assertOk();
+    }
+
+    /**
      * Buat objek UploadedFile .xlsx dari larik baris untuk pengujian impor.
      *
      * @param  list<array{tahun: mixed, bulan: mixed, jumlah_pendaftar: mixed}>  $barisData

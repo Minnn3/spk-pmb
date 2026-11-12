@@ -48,7 +48,14 @@ class PreviewImportDataPendaftarRequest extends FormRequest
                         return;
                     }
 
-                    $path = $value->getPathname();
+                    $ext = strtolower((string) $value->getClientOriginalExtension());
+                    if ($ext !== 'xlsx') {
+                        $fail('Format berkas harus berupa .xlsx (Excel Workbook).');
+
+                        return;
+                    }
+
+                    $path = $value->getRealPath() ?: $value->getPathname();
                     if ($path === '' || ! is_file($path)) {
                         $fail('Berkas yang diunggah tidak ditemukan.');
 
@@ -56,15 +63,20 @@ class PreviewImportDataPendaftarRequest extends FormRequest
                     }
 
                     $finfo = new finfo(FILEINFO_MIME_TYPE);
-                    $mime = (string) $finfo->file($path);
+                    $mime = (string) @$finfo->file($path);
 
                     $allowedMimes = [
                         'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                        'application/vnd.ms-excel',
                         'application/zip',
+                        'application/x-zip-compressed',
                         'application/octet-stream',
+                        'text/plain',
+                        'text/csv',
+                        'inode/x-empty',
                     ];
 
-                    if (! in_array($mime, $allowedMimes, true)) {
+                    if ($mime !== '' && ! in_array($mime, $allowedMimes, true)) {
                         $fail('Format berkas harus berupa .xlsx (Excel Workbook).');
                     }
                 },

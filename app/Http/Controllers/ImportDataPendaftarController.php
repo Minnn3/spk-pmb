@@ -11,6 +11,7 @@ use Illuminate\Contracts\View\View;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Gate;
+use Illuminate\Support\Facades\Log;
 use Symfony\Component\HttpFoundation\StreamedResponse;
 use Throwable;
 
@@ -60,14 +61,20 @@ class ImportDataPendaftarController extends Controller
     ): RedirectResponse {
         $berkas = $request->file('berkas_excel');
         $modeDuplikat = (string) $request->validated('mode_duplikat');
+        $filePath = $berkas->getRealPath() ?: $berkas->getPathname();
 
         try {
             $hasilPratinjau = $excelService->analisisBerkas(
-                $berkas->getRealPath(),
+                $filePath,
                 $berkas->getClientOriginalName(),
                 $modeDuplikat
             );
-        } catch (Throwable) {
+        } catch (Throwable $e) {
+            Log::warning('Gagal membaca berkas impor Excel: ' . $e->getMessage(), [
+                'file' => $berkas->getClientOriginalName(),
+                'path' => $filePath,
+            ]);
+
             return back()
                 ->withInput()
                 ->withErrors([
@@ -127,4 +134,3 @@ class ImportDataPendaftarController extends Controller
             ->with('toast_info', 'Pratinjau impor dibatalkan.');
     }
 }
-
